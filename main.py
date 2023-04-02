@@ -84,10 +84,16 @@ def processDataset():
     # https://www.tensorflow.org/datasets/catalog/protein_net
     (data, metadata) = tfds.load('protein_net', split=['train_100', 'validation', 'test'],
                                  as_supervised=True, with_info=True)
+    # Supervised keys (See as_supervised doc): ('primary', 'tertiary')
     # [Split('validation'), Split('test'), 'train_30', 'train_50', 'train_70', 'train_90', 'train_95', 'train_100'].
-    train_data, val_data, test_data = data  # 3 tuples of (data, ('primary', 'tertiary'))
-    print(metadata)
-    print(train_data)
+    train_data, val_data, test_data = data
+    # print(metadata)
+    sample = tfds.as_dataframe(train_data.take(1), metadata)
+    print(sample)
+    print("Primary:")
+    print(sample['primary'].values[0])
+    print("Tertiary:")
+    print(sample['tertiary'].values[0])
     return
 
     # Preprocess sequences
