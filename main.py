@@ -90,9 +90,9 @@ def processDataset():
     # print(metadata)
     sample = tfds.as_dataframe(train_data.take(1), metadata)
     print(sample)
-    print("Primary:")
+    print("Primary (Sequence):")
     print(sample['primary'].values[0])
-    print("Tertiary:")
+    print("Tertiary (Structure Coordinates):")
     print(sample['tertiary'].values[0])
     return
 
