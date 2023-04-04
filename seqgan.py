@@ -102,7 +102,7 @@ class SeqGAN:
         self.generator = load_model(path + 'generator.h5')
         self.discriminator = load_model(path + 'discriminator.h5')
 
-    def plot(self, path):
+    def plot(self, path=""):
         keras.utils.plot_model(self.generator, to_file=path + 'generator.png', show_shapes=True)
         keras.utils.plot_model(self.discriminator, to_file=path + 'discriminator.png', show_shapes=True)
 
