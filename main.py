@@ -24,6 +24,14 @@ from sklearn.model_selection import train_test_split
 # from tensorflow.keras.preprocessing.sequence import pad_sequences
 from seqgan import SeqGAN, ProteinSeqGAN
 warnings.filterwarnings('ignore')
+TF_GPU_ALLOCATOR = 'cuda_malloc_async'
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(e)
 
 
 def demo_transformer():
@@ -75,12 +83,17 @@ def processDataset():
     # print(sample['tertiary'].values[0])
     # return
 
+    # Cut datasets down to save memory
+    train_data = train_data.take(len(list(train_data)) // 10)
+    val_data = val_data.take(len(list(val_data)) // 10)
+    test_data = test_data.take(len(list(test_data)) // 10)
+
     # Turn the dataset into a pandas dataframe
     train_df = tfds.as_dataframe(train_data, metadata)
     val_df = tfds.as_dataframe(val_data, metadata)
     test_df = tfds.as_dataframe(test_data, metadata)
     print(train_df)
-    batch_size = 32
+    batch_size = 8
 
     def process_dataframe(protein_df, batch_size=32) -> (tf.data.Dataset, int, int, int):
         max_seq_len = max([len(seq) for seq in protein_df['primary']])
@@ -126,7 +139,6 @@ def processDataset():
 
     # Train the model
     epochs = 100
-    batch_size = 32
     history = model.fit(train_data, epochs=epochs, batch_size=batch_size)
 
     model.plot()
