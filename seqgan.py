@@ -95,6 +95,9 @@ class SeqGAN:
         generated_samples = self.generator.predict(noise)
         return generated_samples
 
+    def predict(self, sequence):
+        return self.discriminator.predict(sequence)
+
     def save(self, path=""):
         self.generator.save(path + 'generator.h5')
         self.discriminator.save(path + 'discriminator.h5')
