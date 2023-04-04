@@ -1,5 +1,6 @@
 import tensorflow as tf
-from tensorflow.keras import layers
+from tensorflow import keras as K
+from keras import layers
 
 
 class TransformerLayer(layers.Layer):
