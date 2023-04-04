@@ -56,6 +56,7 @@ class SeqGAN:
         history = []
         # Training loop for SeqGAN
         for epoch in range(epochs):
+            print('Epoch: {}'.format(epoch), end="")
             # Train the discriminator
             # Generate fake data using the generator
             noise = tf.random.normal((batch_size, self.max_length, self.input_dim))
@@ -75,6 +76,7 @@ class SeqGAN:
 
             grads = tape.gradient(total_loss, self.discriminator.trainable_weights)
             self.discriminator_optimizer.apply_gradients(zip(grads, self.discriminator.trainable_weights))
+            print('\tDiscriminator Loss: {}'.format(total_loss.numpy()), end="")
 
             # Train the generator
             with tf.GradientTape() as tape:
@@ -84,9 +86,8 @@ class SeqGAN:
 
             grads = tape.gradient(generator_loss, self.generator.trainable_weights)
             self.generator_optimizer.apply_gradients(zip(grads, self.generator.trainable_weights))
+            print('\tGenerator Loss: {}'.format(generator_loss.numpy()))
             history += {'generator_loss': generator_loss.numpy(), 'discriminator_loss': total_loss.numpy()}
-            print('Epoch: {}, Generator Loss: {}, Discriminator Loss: {}'
-                  .format(epoch, generator_loss.numpy(), total_loss.numpy()))
         return history
 
     def generate(self, num_samples):
@@ -94,11 +95,11 @@ class SeqGAN:
         generated_samples = self.generator.predict(noise)
         return generated_samples
 
-    def save(self, path):
+    def save(self, path=""):
         self.generator.save(path + 'generator.h5')
         self.discriminator.save(path + 'discriminator.h5')
 
-    def load(self, path):
+    def load(self, path=""):
         self.generator = load_model(path + 'generator.h5')
         self.discriminator = load_model(path + 'discriminator.h5')
 
