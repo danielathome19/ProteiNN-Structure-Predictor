@@ -115,6 +115,21 @@ class SeqGAN:
         self.discriminator.summary()
 
 
+class ProteinSeqGAN(SeqGAN):
+    def __init__(self, input_dim, hidden_dim, max_length, num_classes, num_structure_coords):
+        self.num_structure_coords = num_structure_coords
+        super().__init__(input_dim, None, hidden_dim, max_length, num_classes)
+
+    def build_generator(self):
+        # Build the generator model
+        input_noise = Input(shape=(self.max_length, self.input_dim))
+        x = LSTM(self.hidden_dim, return_sequences=True)(input_noise)
+        x = TimeDistributed(Dense(self.num_structure_coords))(x)  # Output layer for structure prediction
+        generator = Model(input_noise, x)
+        generator._name = 'generator'
+        return generator
+
+
 # class SeqGAN:
 #     def __init__(self, seq_length, vocab_size, embedding_dim, gen_hidden_dim, dis_hidden_dim):
 #         self.seq_length = seq_length

@@ -22,7 +22,7 @@ import keras_transformer as ktr
 from tensorflow import keras as K
 from sklearn.model_selection import train_test_split
 # from tensorflow.keras.preprocessing.sequence import pad_sequences
-from seqgan import SeqGAN
+from seqgan import SeqGAN, ProteinSeqGAN
 warnings.filterwarnings('ignore')
 
 
@@ -82,7 +82,7 @@ def processDataset():
     print(train_df)
     batch_size = 32
 
-    def process_dataframe(protein_df, batch_size=32):
+    def process_dataframe(protein_df, batch_size=32) -> (tf.data.Dataset, int, int, int):
         max_seq_len = max([len(seq) for seq in protein_df['primary']])
         padded_primary = K.utils.pad_sequences(protein_df['primary'], maxlen=max_seq_len, padding='post')
         max_tertiary_len = max([len(tertiary) for tertiary in protein_df['tertiary']])
@@ -93,22 +93,41 @@ def processDataset():
         output_data = padded_tertiary[:, 1:]
         # Calculate the number of classes (i.e. the number of unique amino acids)
         nc = len(set([aa for seq in protein_df['primary'] for aa in seq]))
-        return tf.data.Dataset.from_tensor_slices((input_data, output_data)).batch(batch_size), max_seq_len, nc
+        # One-hot encode the amino acid sequences
+        input_data = np.eye(nc)[input_data]
+        ncoords = len(set([tuple(coord) for tertiary in protein_df['tertiary'] for coord in tertiary]))
+        return tf.data.Dataset.from_tensor_slices((input_data, output_data)).batch(batch_size), max_seq_len, nc, ncoords
 
-    train_data, tr_max_len, tr_nc = process_dataframe(train_df, batch_size)
-    val_data, vl_max_len, vl_nc = process_dataframe(val_df, batch_size)
-    test_data, ts_max_len, ts_nc = process_dataframe(test_df, batch_size)
+    train_data, tr_max_len, tr_nc, tr_ncoords = process_dataframe(train_df, batch_size)
+    val_data, vl_max_len, vl_nc, vl_ncoords = process_dataframe(val_df, batch_size)
+    test_data, ts_max_len, ts_nc, ts_ncoords = process_dataframe(test_df, batch_size)
 
     max_seq_len = max(tr_max_len, vl_max_len, ts_max_len)
     num_classes = max(tr_nc, vl_nc, ts_nc)
+    num_coords = int(sum([tr_ncoords, vl_ncoords, ts_ncoords]) / 3)
 
     # Create a SeqGAN model
-    model = SeqGAN(input_dim=100, embedding_dim=64, hidden_dim=256, max_length=max_seq_len, num_classes=num_classes)
-    model.compile(K.optimizers.Adam(lr=0.0002, beta_1=0.5), K.optimizers.Adam(lr=0.0002, beta_1=0.5))
-    model.summary()
+    # model = SeqGAN(input_dim=100, embedding_dim=64, hidden_dim=256, max_length=max_seq_len, num_classes=num_classes)
+    # model.compile(K.optimizers.Adam(lr=0.0002, beta_1=0.5), K.optimizers.Adam(lr=0.0002, beta_1=0.5))
+    # model.summary()
 
     # Train the model
-    history = model.fit(train_data, epochs=10, batch_size=batch_size)
+    # history = model.fit(train_data, epochs=10, batch_size=batch_size)
+    input_dim = 100
+    hidden_dim = 128
+
+    # Instantiate the ProteinSeqGAN model
+    model = ProteinSeqGAN(input_dim, hidden_dim, max_seq_len, num_classes, num_coords)
+
+    # Compile the model
+    generator_optimizer = K.optimizers.Adam(learning_rate=0.0001)
+    discriminator_optimizer = K.optimizers.Adam(learning_rate=0.0001)
+    model.compile(generator_optimizer, discriminator_optimizer)
+
+    # Train the model
+    epochs = 100
+    batch_size = 32
+    history = model.fit(train_data, epochs=epochs, batch_size=batch_size)
 
     model.plot()
     plt.plot(history.history['discriminator_loss'], label='discriminator')
@@ -116,6 +135,9 @@ def processDataset():
     plt.legend()
     plt.show()
 
+    noise = tf.random.normal((1, max_seq_len, input_dim))
+    predicted_structure = model.generator.predict(noise)
+    print(predicted_structure)
     pass
 
 
