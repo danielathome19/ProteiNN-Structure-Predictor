@@ -212,7 +212,7 @@ def main():
     # Initialize ProteinTransformer
     model = ProteinTransformer(config, learning_rate=0.0001)
     model.summary()
-    # model.plot_model()
+    model.plot_model()
 
     # Train the model
     def train_model():
