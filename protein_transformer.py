@@ -1,4 +1,5 @@
 import os
+import time
 import warnings
 import numpy as np
 import tensorflow as tf
@@ -9,251 +10,277 @@ from keras.utils import pad_sequences
 from tensorflow import keras
 from keras import layers
 from keras import mixed_precision
-warnings.filterwarnings('ignore')
-TF_GPU_ALLOCATOR = 'cuda_malloc_async'
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except RuntimeError as e:
-        print(e)
-os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
-policy = mixed_precision.Policy('mixed_float16')
-mixed_precision.set_global_policy(policy)
+from einops import rearrange, reduce, repeat
+from einops.layers.tensorflow import Rearrange, Reduce
+import tensorflow_addons as tfa
+import sidechainnet as scn
+from sidechainnet.examples import losses, models
+from sidechainnet.structure.structure import inverse_trig_transform
+from sidechainnet.structure.build_info import NUM_ANGLES
+import py3Dmol
+import keras.backend as K
 
 
-class ProteinTransformer:
-    def __init__(self, config, learning_rate=0.0001, opt_epsilon=1e-6):
-        self.config = config
-        self.lr = learning_rate
-        self.eps = opt_epsilon
-        self.model = self.build_model()
-        self.weightpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.h5")
+def pytorch_loader_to_tf_dataset(loader, batch_size):
+    def gen():
+        for batch in loader:
+            sequences, angles = batch.seqs.numpy(), batch.angs.numpy()
+            yield sequences, angles
 
-    def build_model(self):
-        inputs = keras.Input(shape=(None,), dtype=tf.int32)
-        x = layers.Embedding(self.config["input_vocab_size"], self.config["d_model"])(inputs)
+    output_signature = (
+        tf.TensorSpec(shape=(None, None, 20), dtype=tf.float32),
+        tf.TensorSpec(shape=(None, None, 12), dtype=tf.float32)
+    )
 
-        for _ in range(self.config["num_layers"]):
-            attn_layer = layers.MultiHeadAttention(num_heads=self.config["num_heads"],
-                                                   key_dim=self.config["d_model"] // self.config["num_heads"])
-            attn_output = attn_layer(x, x, x)
-            x = layers.Add()([x, attn_output])
-            x = layers.LayerNormalization(epsilon=self.eps)(x)
-            x = layers.Dropout(self.config["dropout_rate"])(x)  #
+    # Pad the sequences to the maximum length in the batch
+    max_seq_len = 0
+    max_angle_len = 0
+    for batch in loader:
+        max_seq_len = max(max_seq_len, batch.seqs.shape[1])
+        max_angle_len = max(max_angle_len, batch.angs.shape[1])
 
-            ffn_output = layers.Dense(self.config["dff"], activation='relu')(x)
-            ffn_output = layers.Dense(self.config["d_model"])(ffn_output)
-            x = layers.Add()([x, ffn_output])
-            x = layers.LayerNormalization(epsilon=self.eps)(x)
-            x = layers.Dropout(self.config["dropout_rate"])(x)  #
-
-        x = layers.TimeDistributed(layers.Dense(self.config["output_vocab_size"]))(x)
-
-        initial_learning_rate = self.lr
-        lr_decay_steps = 1000
-        lr_decay_rate = 0.9
-
-        lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-            initial_learning_rate,
-            decay_steps=lr_decay_steps,
-            decay_rate=lr_decay_rate,
-            staircase=True)
-        optimizer = keras.optimizers.Adam(learning_rate=lr_schedule, epsilon=self.eps)
-        model = keras.Model(inputs=inputs, outputs=x)
-        model.compile(optimizer=optimizer, loss="huber", metrics=["mae"])  # loss=mse; also try huber
-        return model
-
-    def train(self, dataset, epochs, batch_size, val_data=None):
-        dataset = dataset.shuffle(buffer_size=len(dataset)).batch(batch_size)
-        checkpoint = keras.callbacks.ModelCheckpoint(self.weightpath, save_weights_only=True,
-                                                     save_best_only=True, monitor='val_loss', verbose=1)  # mon=mae
-        if val_data is not None:
-            val_data = val_data.batch(batch_size)
-            history = self.model.fit(dataset, epochs=epochs, callbacks=[checkpoint], validation_data=val_data)
-        else:
-            history = self.model.fit(dataset, epochs=epochs, callbacks=[checkpoint])
-        return history
-
-    def predict(self, sequence):
-        sequence = np.array([sequence])
-        predicted_structure = self.model.predict(sequence)
-        return predicted_structure
-
-    def summary(self):
-        self.model.summary()
-
-    def plot_model(self):
-        # Get path of current python file
-        keras.utils.plot_model(self.model, show_shapes=True, show_layer_names=True, expand_nested=True, dpi=300,
-                               to_file=os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.png"))
-
-    def load_weights(self):
-        self.model.load_weights(self.weightpath)
-
-    def save_pdb(self, predicted_structure, output_file, encoded_sequence):
-        AMINO_ACIDS = 'ACDEFGHIKLMNPQRSTVWY'
-        AMIN_ACID_NAMES = {"A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE", "G": "GLY", "H": "HIS",
-                           "I": "ILE", "K": "LYS", "L": "LEU", "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN",
-                           "R": "ARG", "S": "SER", "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR"}
-        int_to_aa = {i + 1: aa for i, aa in enumerate(AMINO_ACIDS)}
-
-        pdb_structure = Model.Model(0)
-
-        # Create the chain outside the loop
-        chain = Chain.Chain("A")
-
-        for i, (x, y, z) in enumerate(predicted_structure[0]):
-            res_id = (" ", i + 1, " ")
-            residue_type = int_to_aa[encoded_sequence[i]]
-            residue_type = AMIN_ACID_NAMES[residue_type]
-            res = Residue.Residue(res_id, residue_type, " ")
-            atom = Atom.Atom("CA", np.array([x, y, z]), 1.0, 1.0, " ", "CA", 1)
-            res.add(atom)
-            chain.add(res)
-
-        # Add the chain to the pdb_structure after the loop
-        pdb_structure.add(chain)
-
-        pdb_io = PDBIO()
-        pdb_io.set_structure(pdb_structure)
-        pdb_io.save(output_file)
-
-    @staticmethod
-    def preprocess_data(data):
-        # Flatten the dictionaries and convert the nested arrays into tensors
-        input_sequences = []
-        output_sequences = []
-        for _, row in data.iterrows():
-            input_sequences.append(row['primary'])
-            output_sequences.append(row['tertiary'])
-
-        # Pad the input sequences
-        input_sequences_padded = pad_sequences(input_sequences, padding='post', dtype='int64')
-        input_tensors = tf.constant(input_sequences_padded, dtype=tf.int64)
-
-        # Pad the output sequences
-        max_length = max([len(seq) for seq in output_sequences])
-        output_sequences_padded = [np.pad(seq, ((0, max_length - len(seq)), (0, 0)), mode='constant') for seq in
-                                   output_sequences]
-        output_tensors = tf.constant(output_sequences_padded, dtype=tf.float32)
-
-        # Input tensor shape: (3455, 1520)
-        # Output tensor shape: (3455, 4560, 3)
-        # Pad the input sequences with 0s to match the output sequence length
-        input_tensors = tf.pad(input_tensors, [[0, 0], [0, max_length - input_tensors.shape[1]]], constant_values=0)
-
-        return input_tensors, output_tensors
+    return tf.data.Dataset.from_generator(
+        gen,
+        output_signature=output_signature
+    ).padded_batch(
+        batch_size,
+        padded_shapes=([None, max_seq_len, 20], [None, max_angle_len, 12])
+    )
 
 
-# TODO: fix normalization to calculate the mean and sd of each coordinate (x,y,z)
-def normalize_output_coords(output_tensors):
-    mean_coords = tf.math.reduce_mean(output_tensors, axis=(0, 1))
-    sd_coords = tf.math.reduce_std(output_tensors, axis=(0, 1))
-    output_tensors = (output_tensors - mean_coords) / sd_coords
-    return output_tensors, mean_coords, sd_coords
+def positional_encoding(position, d_model):
+    def get_angles(pos, i, d_model):
+        angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
+        return pos * angle_rates
+
+    angle_rads = get_angles(np.arange(position)[:, np.newaxis],
+                            np.arange(d_model)[np.newaxis, :],
+                            d_model)
+    angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+    angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+
+    pos_encoding = angle_rads[np.newaxis, ...]
+
+    return tf.cast(pos_encoding, dtype=tf.float32)
 
 
-def rescale_coordinates(predicted_structure, mean_coords, sd_coords):
-    return (predicted_structure * sd_coords) + mean_coords
+def create_padding_mask(seq):
+    seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
+
+    return seq[:, tf.newaxis, tf.newaxis, :]
 
 
-def load_and_preprocess_data():
-    (data, metadata) = tfds.load('protein_net', split=['train_100', 'validation', 'test'],
-                                 as_supervised=True, with_info=True)
-    train_data, val_data, test_data = data
+def scaled_dot_product_attention(q, k, v, mask):
+    matmul_qk = tf.matmul(q, k, transpose_b=True)
 
-    # Cut datasets down to save memory
-    train_data = train_data.take(len(list(train_data)) // 20)  # 10
-    val_data = val_data.take(len(list(val_data)) // 20)
-    test_data = test_data.take(len(list(test_data)) // 20)
+    dk = tf.cast(tf.shape(k)[-1], tf.float32)
+    scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
 
-    train_df = tfds.as_dataframe(train_data, metadata)
-    val_df = tfds.as_dataframe(val_data, metadata)
-    test_df = tfds.as_dataframe(test_data, metadata)
-    train_input_tensors, train_output_tensors = ProteinTransformer.preprocess_data(train_df)
-    # print("Input tensor shape:", train_input_tensors.shape)
-    # print("Output tensor shape:", train_output_tensors.shape)
-    val_input_tensors, val_output_tensors = ProteinTransformer.preprocess_data(val_df)
-    test_input_tensors, test_output_tensors = ProteinTransformer.preprocess_data(test_df)
+    if mask is not None:
+        scaled_attention_logits += (mask * -1e9)
 
-    # Normalize the output coordinates; scaling the coordinates to have a mean of 0 and a
-    # standard deviation of 1 could help the model converge faster.
-    train_output_tensors, train_mean, train_sd = normalize_output_coords(train_output_tensors)
-    val_output_tensors, _, _ = normalize_output_coords(val_output_tensors)
-    test_output_tensors, _, _ = normalize_output_coords(test_output_tensors)
+    attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
 
-    train_dataset = tf.data.Dataset.from_tensor_slices((train_input_tensors, train_output_tensors))
-    val_dataset = tf.data.Dataset.from_tensor_slices((val_input_tensors, val_output_tensors))
-    test_dataset = tf.data.Dataset.from_tensor_slices((test_input_tensors, test_output_tensors))
-    return train_dataset, val_dataset, test_dataset, train_mean, train_sd
+    output = tf.matmul(attention_weights, v)
+    return output, attention_weights
 
 
-def encode_sequence(sequence):
-    AMINO_ACIDS = 'ACDEFGHIKLMNPQRSTVWY'
-    aa_to_int = {aa: i + 1 for i, aa in enumerate(AMINO_ACIDS)}
-    return [aa_to_int[aa] for aa in sequence]
+def point_wise_feed_forward_network(d_model, dff):
+    return keras.Sequential([
+        layers.Dense(dff, activation='relu'),
+        layers.Dense(d_model)
+    ])
+
+
+class EncoderLayer(layers.Layer):
+    def __init__(self, d_model, num_heads, dff, dropout_rate=0.1):
+        super(EncoderLayer, self).__init__()
+
+        self.mha = MultiHeadAttention(d_model, num_heads)
+        self.ffn = point_wise_feed_forward_network(d_model, dff)
+
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+
+        self.dropout1 = layers.Dropout(dropout_rate)
+        self.dropout2 = layers.Dropout(dropout_rate)
+
+    def call(self, x, training, mask):
+        attn_output = self.mha(x, x, x, mask)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(x + attn_output)
+
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        out2 = self.layernorm2(out1 + ffn_output)
+
+        return out2
+
+
+class MultiHeadAttention(layers.Layer):
+    def __init__(self, d_model, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.d_model = d_model
+
+        self.depth = d_model // self.num_heads
+
+        self.wq = layers.Dense(d_model)
+        self.wk = layers.Dense(d_model)
+        self.wv = layers.Dense(d_model)
+
+        self.dense = layers.Dense(d_model)
+
+    def split_heads(self, x, batch_size):
+        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
+        return tf.transpose(x, perm=[0, 2, 1, 3])
+
+    def call(self, v, k, q, mask):
+        batch_size = tf.shape(q)[0]
+
+        q = self.wq(q)
+        k = self.wk(k)
+        v = self.wv(v)
+
+        q = self.split_heads(q, batch_size)
+        k = self.split_heads(k, batch_size)
+        v = self.split_heads(v, batch_size)
+
+        scaled_attention, _ = scaled_dot_product_attention(q, k, v, mask)
+        scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])
+
+        concat_attention = tf.reshape(scaled_attention, (batch_size, -1, self.d_model))
+        output = self.dense(concat_attention)
+
+        return output
+
+
+class ProteinTransformer(keras.Model):
+    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, output_dim, dropout_rate=0.1):
+        super(ProteinTransformer, self).__init__()
+        self.d_model = d_model
+
+        self.embedding = layers.Embedding(input_vocab_size, d_model)
+        self.pos_encoding = positional_encoding(input_vocab_size, self.d_model)
+
+        self.encoder_layers = [EncoderLayer(d_model, num_heads, dff, dropout_rate) for _ in range(num_layers)]
+
+        self.dense_output = layers.Dense(output_dim)
+        self.dropout_output = layers.Dropout(dropout_rate)
+
+    def call(self, x, training, mask=None):
+        seq_len = tf.shape(x)[1]
+
+        x = self.embedding(x)
+        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        x += self.pos_encoding[:, :seq_len, :]
+
+        for encoder_layer in self.encoder_layers:
+            x = encoder_layer(x, training, mask)
+
+        x = self.dense_output(x)
+        x = self.dropout_output(x, training=training)
+
+        return x
 
 
 def main():
-    config = {
-        "num_layers": 5,  # 6 (try 3-5)
-        "d_model": 128,  # 256 (try 128 or 512)
-        "num_heads": 8,  # 8 (try 4 or 16)
-        "dff": 256,  # 512 (try 256 or 1024)
-        "input_vocab_size": 21,
-        "output_vocab_size": 3,
-        "max_position_encoding": 10000,
-        "dropout_rate": 0.1,
-    }
-    train_data, val_data, test_data, train_mean, train_sd = load_and_preprocess_data()
+    # Load the data in the appropriate format for training.
+    batch_size = 4
+    dataloader = scn.load(
+        with_pytorch="dataloaders",
+        batch_size=batch_size,
+        dynamic_batching=False,
+        thinning=30,
+        num_workers=0,
+        seq_as_onehot=True)
+    # print("Available Dataloaders:", list(dataloader.keys()))
 
-    # Initialize ProteinTransformer
-    model = ProteinTransformer(config, learning_rate=0.0001)
+    dataloaders = {}
+    for key in dataloader.keys():
+        if key in ['train', 'test', 'valid-20']:
+            dataloaders[key] = pytorch_loader_to_tf_dataset(dataloader[key], batch_size)
+    # print("Dataset:", dataloaders)
+
+    # Define the model's hyperparameters
+    num_layers = 4
+    d_model = 128
+    num_heads = 8
+    dff = 512
+    input_vocab_size = 21
+    output_dim = 12
+    dropout_rate = 0.1
+
+    model = ProteinTransformer(num_layers, d_model, num_heads, dff, input_vocab_size, output_dim, dropout_rate)
+
+    # Define the optimizer, loss function, and metrics
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+    loss_object = tf.keras.losses.MeanSquaredError()
+
+    train_loss = tf.keras.metrics.Mean(name='train_loss')
+    valid_loss = tf.keras.metrics.Mean(name='valid_loss')
+
+    @tf.function
+    def train_step(inp, tar):
+        with tf.GradientTape() as tape:
+            predictions = model(inp, training=True)
+            loss = loss_object(tar, predictions)
+
+        gradients = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+        train_loss(loss)
+
+    # Define the validation step
+    @tf.function
+    def valid_step(inp, tar):
+        predictions = model(inp, training=False)
+        loss = loss_object(tar, predictions)
+
+        valid_loss(loss)
+
+    # Training and validation loop
+    epochs = 20
+
+    for epoch in range(epochs):
+        start = time.time()
+
+        train_loss.reset_states()
+        valid_loss.reset_states()
+
+        for (batch, (inp, tar)) in enumerate(dataloaders['train']):
+            train_step(inp, tar)
+
+        for (batch, (inp, tar)) in enumerate(dataloaders['valid-20']):
+            valid_step(inp, tar)
+
+        print(f'Epoch {epoch + 1}, '
+              f'Train Loss: {train_loss.result()}, '
+              f'Validation Loss: {valid_loss.result()}, '
+              f'Time taken for this epoch: {time.time() - start:.2f} secs')
+
     model.summary()
-    model.plot_model()
+    tf.keras.utils.plot_model(model, to_file='protein_transformer.png', show_shapes=True)
 
-    # Train the model
-    def train_model():
-        history = model.train(train_data, epochs=10, batch_size=4, val_data=val_data)  # batch_size=2
-        plt.plot(history.history['mae'])
-        plt.plot(history.history['val_mae'])
-        plt.title('Model MAE')
-        plt.ylabel('MAE')
-        plt.xlabel('Epoch')
-        plt.legend(['Train', 'Val'], loc='upper left')
-        plt.show()
+    # Save the trained model
+    model.save_weights('protein_transformer_weights.h5')
 
-        plt.plot(history.history['loss'])
-        plt.plot(history.history['val_loss'])
-        plt.title('Model Loss')
-        plt.ylabel('Loss')
-        plt.xlabel('Epoch')
-        plt.legend(['Train', 'Val'], loc='upper left')
-        plt.show()
+    # Test the model on a protein sequence
+    test_sequence = "MGSSHHHHHHSSGLVPRGSHMRGPNPTAASLEASAGPFTVRSFTVSRPSGYGAGTVYYPTNAGGTVGAIAIVPGYTARQSSIKWWGPR" \
+                    "LASHGFVVITIDTNSTLDQPSSRSSQQMAALRQVASLNGTSSSPIYGKVDTARMGVMGWSMGGGGSLISAANNPSLKAAAPQAPWDSS" \
+                    "TNFSSVTVPTLIFACENDSIAPVNSSALPIYDSMSRNAKQFLEINGGSHSCANSGNSNQALIGKKGVAWMKRFMDNDTRYSTFACENP" \
+                    "NSTRVSDFRTANCSLEDPAANKARKEAELAAATAEQ"
+    input_sequence = np.array([scn.onehot(test_sequence, 'seq')], dtype=np.float32)
 
-    # train_model()
-    model.load_weights()
-
-    sequence = "MGSSHHHHHHSSGLVPRGSHMRGPNPTAASLEASAGPFTVRSFTVSRPSGYGAGTVYYPTNAGGTVGAIAIVPGYTARQSSIKWWGPR" \
-               "LASHGFVVITIDTNSTLDQPSSRSSQQMAALRQVASLNGTSSSPIYGKVDTARMGVMGWSMGGGGSLISAANNPSLKAAAPQAPWDSS" \
-               "TNFSSVTVPTLIFACENDSIAPVNSSALPIYDSMSRNAKQFLEINGGSHSCANSGNSNQALIGKKGVAWMKRFMDNDTRYSTFACENP" \
-               "NSTRVSDFRTANCSLEDPAANKARKEAELAAATAEQ"
-
-    # Predict the protein structure
-    # protein_sequence = [2, 2, 5, 16, 5, 13, 8, 13, 7, 18, 14, 7, 3, 5, 13, 12, 0]
-    protein_sequence = encode_sequence(sequence)
-    predicted_structure = model.predict(protein_sequence)
-
-    # Save the predicted structure as a PDB file
-    predicted_structure = rescale_coordinates(predicted_structure, train_mean, train_sd)  #
-    # model.save_pdb(predicted_structure, "predicted_structure.pdb")
-    model.save_pdb(predicted_structure, "predicted_structure.pdb", protein_sequence)
+    predicted_angles = model(input_sequence, training=False)
+    predicted_angles = np.squeeze(predicted_angles.numpy(), axis=0)
+    # Save the predicted structure to a PDB file
+    coords, _, _ = inverse_trig_transform(predicted_angles)
+    scn.save_pdb(coords.numpy(), test_sequence, "predicted_structure.pdb")
     pass
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     print("Hello world!")
     main()
     print("\nDone!")

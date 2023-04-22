@@ -94,7 +94,6 @@ def processDataset():
     test_df = tfds.as_dataframe(test_data, metadata)
     print(train_df)
     batch_size = 8
-    return
 
     def process_dataframe(protein_df, batch_size=32) -> (tf.data.Dataset, int, int, int):
         max_seq_len = max([len(seq) for seq in protein_df['primary']])
