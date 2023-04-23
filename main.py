@@ -1,176 +1,409 @@
-import tensorflow as tf
-import numpy as np
-import pandas as pd
-import sklearn as sk
-import matplotlib.pyplot as plt
-import seaborn as sns
-import Bio as bp
 import os
-import sys
-import time
-import datetime
-import math
-import random
-import pickle
-import gc
-import transformer as tfr
 import warnings
-import tensorflow_datasets as tfds
-# import tensorflow_models as tfm
-import data_utils as du
-import keras_transformer as ktr
-from tensorflow import keras as K
-from sklearn.model_selection import train_test_split
-# from tensorflow.keras.preprocessing.sequence import pad_sequences
-from seqgan import SeqGAN, ProteinSeqGAN
-warnings.filterwarnings('ignore')
-TF_GPU_ALLOCATOR = 'cuda_malloc_async'
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except RuntimeError as e:
-        print(e)
+import numpy as np
+import matplotlib.pyplot as plt
+from einops import rearrange, reduce, repeat
+import sidechainnet as scn
+from sidechainnet.structure.structure import inverse_trig_transform
+from sidechainnet.structure.build_info import NUM_ANGLES
+import py3Dmol
+import torch
+from torch import nn, einsum
+import random
+from inspect import isfunction
+from tqdm import tqdm
+import dill as pickle
 
 
-def demo_transformer():
-    sequences = []
+def exists(val):
+    return val is not None
 
-    seq_len = 256  # change to the actual sequence length later on
-    vocab_size = 21
-    embed_dim = 64
-    num_heads = 4
-    ff_dim = 256
-    num_blocks = 6
-    output_dim = 2 * seq_len  # 2 torsion angles (phi, psi) for each residue
 
-    padded_sequences = K.utils.pad_sequences(sequences, maxlen=seq_len, padding='post', truncating='post')
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
 
-    # Create the model
-    # Note that this is a simple example and may not achieve high accuracy.
-    # To improve the model, maybe explore advanced techniques, such as incorporating evolutionary information from
-    # multiple sequence alignments, using larger datasets, or employing more sophisticated architecture designs.
-    # model = tfr.protein_structure_model(seq_len, vocab_size, embed_dim, num_heads, ff_dim, num_blocks, output_dim)
-    model = tfr.Transformer(vocab_size, embed_dim, num_heads, ff_dim, num_blocks, output_dim)
-    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
 
-    # Generate dummy data
-    x = np.random.randint(0, vocab_size, size=(1000, seq_len))
-    y = np.random.random((1000, output_dim))
+def cast_tuple(val, depth=1):
+    return val if isinstance(val, tuple) else (val,) * depth
 
-    # Train the model
-    model.fit(x, y, batch_size=32, epochs=2)
 
-    model.summary()
+def init_zero_(layer):
+    nn.init.constant_(layer.weight, 0.)
+    if exists(layer.bias):
+        nn.init.constant_(layer.bias, 0.)
+
+
+def init_loss_optimizer(model):
+    optimizer = torch.optim.Adam(model.parameters())
+    batch_losses = []
+    epoch_training_losses = []
+    epoch_test_losses = []
+    mse_loss = torch.nn.MSELoss()
+
+    return optimizer, batch_losses, epoch_training_losses, epoch_test_losses, mse_loss
+
+
+def build_visualizable_structures(model, data, device):
+    # For one batch of data, build a structure using the model's predictions
+    with torch.no_grad():
+        for batch in data:
+            model_input = batch.int_seqs.to(device)
+            mask_ = batch.msks.to(device)
+            # Make predictions for angles, and construct 3D atomic coordinates
+            predicted_angles_sincos = model(model_input, mask=mask_)
+            # Because the model predicts sin/cos values, we use this function to recover the original angles
+            predicted_angles = inverse_trig_transform(predicted_angles_sincos)
+            # Use BatchedStructureBuilder to build an entire batch of structures
+            sb_pred = scn.BatchedStructureBuilder(batch.int_seqs, predicted_angles.cpu())
+            sb_true = scn.BatchedStructureBuilder(batch.int_seqs, batch.crds.cpu())
+            break
+    return sb_pred, sb_true
+
+
+def plot_protein(exp1, exp2):
+    p = py3Dmol.view(js='https://3dmol.org/build/3Dmol.js', viewergrid=(2, 1))
+    p.addModel(open(exp1, 'r').read(), 'pdb', viewer=(0, 0))
+    p.addModel(open(exp2, 'r').read(), 'pdb', viewer=(1, 0))
+    p.setStyle({'cartoon': {'color': 'spectrum'}})
+    p.zoomTo()
+    p.show()
+
+
+def encode_sequence(sequence):
+    AMINO_ACIDS = 'ACDEFGHIKLMNPQRSTVWY'
+    aa_to_int = {aa: i + 1 for i, aa in enumerate(AMINO_ACIDS)}
+    return [aa_to_int[aa] for aa in sequence]
+
+
+def predict_train(model, dataloader, device):
+    s_pred, s_true = build_visualizable_structures(model, dataloader["train"], device)
+    z_idx = 2
+    for idx in range(3):
+        s_pred.to_pdb(idx, path='{}_{}_pred.pdb'.format(idx, z_idx))
+        s_true.to_pdb(idx, path='{}_{}_true.pdb'.format(idx, z_idx))
+        # plot_protein('{}_{}_pred.pdb'.format(idx, z_idx), '{}_{}_true.pdb'.format(idx, z_idx))  # For Jupyter
+
+
+def predict_sequence(model, sequence, device):
+    int_seq = encode_sequence(sequence)
+    int_seq = torch.tensor(int_seq).unsqueeze(0)
+    mask = torch.ones(int_seq.shape)
+    predicted_angles_sincos = model(int_seq.to(device), mask=mask.to(device))
+    predicted_angles = inverse_trig_transform(predicted_angles_sincos)
+    sb_pred = scn.BatchedStructureBuilder(int_seq, predicted_angles.cpu())
+    sb_pred.to_pdb(0, path='input_pred.pdb')
+
+
+class Attention(nn.Module):
+    def __init__(
+            self,
+            dim,
+            seq_len=None,
+            heads=8,
+            dim_head=64,
+            dropout=0.0,
+            gating=True
+    ):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.seq_len = seq_len
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim)
+
+        self.gating = nn.Linear(dim, inner_dim)
+        nn.init.constant_(self.gating.weight, 0.)
+        nn.init.constant_(self.gating.bias, 1.)
+
+        self.dropout = nn.Dropout(dropout)
+        init_zero_(self.to_out)
+
+    def forward(self, x, mask=None, attn_bias=None, context=None, context_mask=None, tie_dim=None):
+        device, orig_shape, h, has_context = x.device, x.shape, self.heads, exists(context)
+        context = default(context, x)
+        q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim=-1))
+        i, j = q.shape[-2], k.shape[-2]
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), (q, k, v))
+
+        # scale
+        q = q * self.scale
+
+        # query / key similarities
+        if exists(tie_dim):
+            # as in the paper, for the extra MSAs
+            # they average the queries along the rows of the MSAs
+            # they named this particular module MSAColumnGlobalAttention
+
+            q, k = map(lambda t: rearrange(t, '(b r) ... -> b r ...', r=tie_dim), (q, k))
+            q = q.mean(dim=1)
+
+            dots = einsum('b h i d, b r h j d -> b r h i j', q, k)
+            dots = rearrange(dots, 'b r ... -> (b r) ...')
+        else:
+            dots = einsum('b h i d, b h j d -> b h i j', q, k)
+
+        # add attention bias, if supplied (for pairwise to msa attention communication)
+        if exists(attn_bias):
+            dots = dots + attn_bias
+
+        # masking
+        if exists(mask):
+            mask = default(mask, lambda: torch.ones(1, i, device=device).bool())
+            context_mask = mask if not has_context else default(context_mask, lambda:
+                                                                torch.ones(1, k.shape[-2], device=device).bool())
+            mask_value = -torch.finfo(dots.dtype).max
+            mask = mask[:, None, :, None] * context_mask[:, None, None, :]
+            try:
+                mask = mask.to(torch.bool)
+                dots = dots.masked_fill(~mask, mask_value)
+            except:
+                dots = dots.masked_fill(mask, mask_value)
+
+        # attention
+        dots = dots - dots.max(dim=-1, keepdims=True).values
+        attn = dots.softmax(dim=-1)
+        attn = self.dropout(attn)
+        # aggregate
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        # merge heads
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        # gating
+        gates = self.gating(x)
+        out = out * gates.sigmoid()
+        # combine to out
+        out = self.to_out(out)
+        return out
+
+
+class ProteinNet(nn.Module):
+    """A protein sequence-to-angle model that consumes integer-coded sequences."""
+
+    def __init__(self,
+                 d_hidden,
+                 dim,
+                 d_in=21,
+                 d_embedding=32,
+                 heads=8,
+                 integer_sequence=True,
+                 n_angles=scn.structure.build_info.NUM_ANGLES):
+
+        super(ProteinNet, self).__init__()
+        # Dimensionality of RNN hidden state
+        self.d_hidden = d_hidden
+
+        self.attn = Attention(dim=dim, heads=heads)
+        # Output vector dimensionality (per amino acid)
+        self.d_out = n_angles * 2
+        # Output projection layer. (from RNN -> target tensor)
+        self.hidden2out = nn.Sequential(
+            nn.Linear(d_embedding, d_hidden),
+            nn.GELU(),
+            nn.Linear(d_hidden, self.d_out)
+        )
+        self.out2attn = nn.Linear(self.d_out, dim)
+        self.final = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(dim, self.d_out))
+        self.norm_0 = nn.LayerNorm([dim])
+        self.norm_1 = nn.LayerNorm([dim])
+        self.activation_0 = nn.GELU()
+        self.activation_1 = nn.GELU()
+
+        # Activation function for the output values (bounds values to [-1, 1])
+        self.output_activation = torch.nn.Tanh()
+
+        # We embed our model's input differently depending on the type of input
+        self.integer_sequence = integer_sequence
+        if self.integer_sequence:
+            self.input_embedding = torch.nn.Embedding(d_in, d_embedding, padding_idx=20)
+        else:
+            self.input_embedding = torch.nn.Linear(d_in, d_embedding)
+
+    def get_lengths(self, sequence):
+        """Compute the lengths of each sequence in the batch."""
+        if self.integer_sequence:
+            lengths = sequence.shape[-1] - (sequence == 20).sum(axis=1)
+        else:
+            lengths = sequence.shape[1] - (sequence == 0).all(axis=-1).sum(axis=1)
+        return lengths.cpu()
+
+    def forward(self, sequence, mask=None):
+        """Run one forward step of the model."""
+        # First, we compute sequence lengths
+        lengths = self.get_lengths(sequence)
+
+        # Next, we embed our input tensors for input to the RNN
+        sequence = self.input_embedding(sequence)
+
+        # Then we pass in our data into the RNN via PyTorch's pack_padded_sequences
+        sequence = torch.nn.utils.rnn.pack_padded_sequence(sequence,
+                                                           lengths,
+                                                           batch_first=True,
+                                                           enforce_sorted=False)
+        output, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(sequence,
+                                                                        batch_first=True)
+        # At this point, output has the same dimentionality as the RNN's hidden
+        # state: i.e. (batch, length, d_hidden).
+
+        # We use a linear transformation to transform our output tensor into the
+        # correct dimensionality (batch, length, 24)
+        output = self.hidden2out(output)
+        output = self.out2attn(output)
+        output = self.activation_0(output)
+        output = self.norm_0(output)
+        output = self.attn(output, mask=mask)
+        output = self.activation_1(output)
+        output = self.norm_1(output)
+        output = self.final(output)
+
+        # Next, we need to bound the output values between [-1, 1]
+        output = self.output_activation(output)
+
+        # Finally, reshape the output to be (batch, length, angle, (sin/cos val))
+        output = output.view(output.shape[0], output.shape[1], 12, 2)
+
+        return output
+
+
+def main(mode="train", sequence=""):
+    warnings.filterwarnings('ignore')
+    seed = 0
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using {device}.")
+
+    # Load the data in the appropriate format for training.
+    batch_size = 4
+    dataloader = scn.load(
+        with_pytorch="dataloaders",
+        batch_size=batch_size,
+        dynamic_batching=False,
+        num_workers=0)
+    # print("Available Dataloaders:", list(dataloader.keys()))
+
+    def validation(model, datasplit):
+        """Evaluate a model (sequence->sin/cos represented angles [-1,1]) on MSE."""
+        total = 0.0
+        n = 0
+        print("Running validation...")
+        with torch.no_grad():
+            for batch in datasplit:
+                # Prepare variables and create a mask of missing angles (padded with zeros)
+                # The mask is repeated in the last dimension to match the sin/cos represenation.
+                seqs = batch.int_seqs.to(device).long()
+                mask_ = batch.msks.to(device)
+                true_angles_sincosine = scn.structure.trig_transform(batch.angs).to(device)
+                mask = (batch.angs.ne(0)).unsqueeze(-1).repeat(1, 1, 1, 2)
+
+                # Make predictions and optimize
+                predicted_angles = model(seqs, mask=mask_)
+                loss = mse_loss(predicted_angles[mask], true_angles_sincosine[mask])
+
+                total += loss
+                n += 1
+
+        return torch.sqrt(total / n)
+
+    def train(model, n_epoch):
+        for epoch in range(n_epoch):
+            print(f'Epoch {epoch}')
+            progress_bar = tqdm(total=len(dataloader['train']), smoothing=0)
+            for batch in dataloader['train']:
+                # Prepare variables and create a mask of missing angles (padded with zeros)
+                # The mask is repeated in the last dimension to match the sin/cos represenation.
+                seqs = batch.int_seqs.to(device).long()
+                mask_ = batch.msks.to(device)
+                true_angles_sincos = scn.structure.trig_transform(batch.angs).to(device)
+                mask = (batch.angs.ne(0)).unsqueeze(-1).repeat(1, 1, 1, 2)
+
+                # Make predictions and optimize
+                predicted_angles = model(seqs, mask=mask_)
+                loss = mse_loss(predicted_angles[mask], true_angles_sincos[mask])
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2)
+                optimizer.step()
+
+                # Housekeeping
+                batch_losses.append(float(loss))
+                progress_bar.update(1)
+                progress_bar.set_description(f"\rRMSE Loss = {np.sqrt(float(loss)):.4f}")
+            # Evaluate the model's performance on train-eval, downsampled for efficiency
+            epoch_training_losses.append(validation(model, dataloader['train-eval']))
+            print(f"     Train-eval loss = {epoch_training_losses[-1]:.4f}")
+        # Evaluate the model on the test set
+        epoch_test_losses.append(validation(model, dataloader['test']))
+        print(f"Test loss = {epoch_test_losses[-1]:.4f}")
+
+    model = ProteinNet(d_hidden=512,
+                       dim=256,
+                       d_in=49,
+                       d_embedding=32,
+                       integer_sequence=True)
+    model = model.to(device)
+    optimizer, batch_losses, epoch_training_losses, epoch_test_losses, mse_loss = init_loss_optimizer(model)
+
+    # TODO: Train the model
+    if mode == "train":
+        train(model, 25)
+        torch.save(model.state_dict(), 'model.pt')
+
+        # Export the model to ONNX for visualization in Netron
+        batch = next(iter(dataloader['train']))
+        seqs = batch.int_seqs.to(device).long()
+        mask_ = batch.msks.to(device)
+        torch.onnx.export(model, (seqs, mask_), "model.onnx", opset_version=12)
+
+        # Plot the loss of each batch over time
+        plt.plot(np.sqrt(np.asarray(batch_losses)), label='batch loss')
+        plt.ylabel("RMSE")
+        plt.xlabel("Step")
+        plt.title("Training Loss over Time")
+        plt.show()
+
+        # Plot the loss of each epoch over time
+        plt.plot([x.cpu().detach().numpy() for x in epoch_training_losses], label='train-eval')
+        plt.plot([x.cpu().detach().numpy() for x in epoch_test_losses], label='test')
+        plt.ylabel("RMSE")
+        plt.xlabel("Epoch")
+        plt.title("Training and Validation Losses over Time")
+        plt.legend()
+        plt.show()
+
+        predict_train(model, dataloader, device)
+
+    if mode == "predict":
+        # Load the model
+        model.load_state_dict(torch.load('model.pt'))
+        predict_sequence(model, sequence, device)
+
     pass
 
 
-def processDataset():
-    # Load the proteinNet dataset from tfds
-    # https://www.tensorflow.org/datasets/catalog/protein_net
-    (data, metadata) = tfds.load('protein_net', split=['train_100', 'validation', 'test'],
-                                 as_supervised=True, with_info=True)
-    # Supervised keys (See as_supervised doc): ('primary', 'tertiary')
-    # [Split('validation'), Split('test'), 'train_30', 'train_50', 'train_70', 'train_90', 'train_95', 'train_100'].
-    train_data, val_data, test_data = data
-    # print(metadata)
-    # sample = tfds.as_dataframe(train_data.take(1), metadata)
-    # print(sample)
-    # print("Primary (Sequence):")
-    # print(sample['primary'].values[0])
-    # print("Tertiary (Structure Coordinates):")
-    # print(sample['tertiary'].values[0])
-    # return
-
-    # Cut datasets down to save memory
-    train_data = train_data.take(len(list(train_data)) // 10)
-    val_data = val_data.take(len(list(val_data)) // 10)
-    test_data = test_data.take(len(list(test_data)) // 10)
-
-    # Turn the dataset into a pandas dataframe
-    train_df = tfds.as_dataframe(train_data, metadata)
-    val_df = tfds.as_dataframe(val_data, metadata)
-    test_df = tfds.as_dataframe(test_data, metadata)
-    print(train_df)
-    batch_size = 8
-
-    def process_dataframe(protein_df, batch_size=32) -> (tf.data.Dataset, int, int, int):
-        max_seq_len = max([len(seq) for seq in protein_df['primary']])
-        padded_primary = K.utils.pad_sequences(protein_df['primary'], maxlen=max_seq_len, padding='post')
-        max_tertiary_len = max([len(tertiary) for tertiary in protein_df['tertiary']])
-        padded_tertiary = np.zeros((len(protein_df['tertiary']), max_tertiary_len, 3))
-        for i, tertiary in enumerate(protein_df['tertiary']):
-            padded_tertiary[i, :len(tertiary)] = tertiary
-        input_data = padded_primary[:, :-1]
-        output_data = padded_tertiary[:, 1:]
-        # Calculate the number of classes (i.e. the number of unique amino acids)
-        nc = len(set([aa for seq in protein_df['primary'] for aa in seq]))
-        # One-hot encode the amino acid sequences
-        input_data = np.eye(nc)[input_data]
-        ncoords = len(set([tuple(coord) for tertiary in protein_df['tertiary'] for coord in tertiary]))
-        return tf.data.Dataset.from_tensor_slices((input_data, output_data)).batch(batch_size), max_seq_len, nc, ncoords
-
-    train_data, tr_max_len, tr_nc, tr_ncoords = process_dataframe(train_df, batch_size)
-    val_data, vl_max_len, vl_nc, vl_ncoords = process_dataframe(val_df, batch_size)
-    test_data, ts_max_len, ts_nc, ts_ncoords = process_dataframe(test_df, batch_size)
-
-    max_seq_len = max(tr_max_len, vl_max_len, ts_max_len)
-    num_classes = max(tr_nc, vl_nc, ts_nc)
-    num_coords = int(sum([tr_ncoords, vl_ncoords, ts_ncoords]) / 3)
-
-    # Create a SeqGAN model
-    # model = SeqGAN(input_dim=100, embedding_dim=64, hidden_dim=256, max_length=max_seq_len, num_classes=num_classes)
-    # model.compile(K.optimizers.Adam(lr=0.0002, beta_1=0.5), K.optimizers.Adam(lr=0.0002, beta_1=0.5))
-    # model.summary()
-
-    # Train the model
-    # history = model.fit(train_data, epochs=10, batch_size=batch_size)
-    input_dim = 100
-    hidden_dim = 128
-
-    # Instantiate the ProteinSeqGAN model
-    model = ProteinSeqGAN(input_dim, hidden_dim, max_seq_len, num_classes, num_coords)
-
-    # Compile the model
-    generator_optimizer = K.optimizers.Adam(learning_rate=0.0001)
-    discriminator_optimizer = K.optimizers.Adam(learning_rate=0.0001)
-    model.compile(generator_optimizer, discriminator_optimizer)
-
-    # Train the model
-    epochs = 100
-    history = model.fit(train_data, epochs=epochs, batch_size=batch_size)
-
-    model.plot()
-    plt.plot(history.history['discriminator_loss'], label='discriminator')
-    plt.plot(history.history['generator_loss'], label='generator')
-    plt.legend()
-    plt.show()
-
-    noise = tf.random.normal((1, max_seq_len, input_dim))
-    predicted_structure = model.generator.predict(noise)
-    print(predicted_structure)
-    pass
-
-
-def trainModel():
-    pass
-
-
-def predictStructure():
-    sequence = input("Enter a protein sequence or hit Enter to use the default: ")
-    if sequence == "":
-        sequence = "MGSSHHHHHHSSGLVPRGSHMRGPNPTAASLEASAGPFTVRSFTVSRPSGYGAGTVYYPTNAGGTVGAIAIVPGYTARQSSIKWWGPR" \
-                   "LASHGFVVITIDTNSTLDQPSSRSSQQMAALRQVASLNGTSSSPIYGKVDTARMGVMGWSMGGGGSLISAANNPSLKAAAPQAPWDSS" \
-                   "TNFSSVTVPTLIFACENDSIAPVNSSALPIYDSMSRNAKQFLEINGGSHSCANSGNSNQALIGKKGVAWMKRFMDNDTRYSTFACENP" \
-                   "NSTRVSDFRTANCSLEDPAANKARKEAELAAATAEQ"
-    # plDDT is a per-residue estimate of the confidence in prediction on a scale from 0-100.
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     print("Hello world!")
-    # demo_transformer()
-    processDataset()
-    # trainModel()
-    # predictStructure()
+    # mode = input("Choose a mode from one of the following: train, predict: ")
+    modeMain = "predict"
+    if modeMain not in ["train", "predict"]:
+        raise ValueError(f"Invalid mode: {modeMain}")
+    else:
+        sequenceMain = "MGSSHHHHHHSSGLVPRGSHMRGPNPTAASLEASAGPFTVRSFTVSRPSGYGAGTVYYPTNAGGTVGAIAIVPGYTARQSSIKWWGPR" \
+                       "LASHGFVVITIDTNSTLDQPSSRSSQQMAALRQVASLNGTSSSPIYGKVDTARMGVMGWSMGGGGSLISAANNPSLKAAAPQAPWDSS" \
+                       "TNFSSVTVPTLIFACENDSIAPVNSSALPIYDSMSRNAKQFLEINGGSHSCANSGNSNQALIGKKGVAWMKRFMDNDTRYSTFACENP" \
+                       "NSTRVSDFRTANCSLEDPAANKARKEAELAAATAEQ"
+        if modeMain == "predict:":
+            # s_in = input("Enter a protein sequence, or hit 'Enter' for the default: ")
+            s_in = ""
+            sequenceMain = s_in if s_in else sequenceMain
+        main(modeMain, sequenceMain)
     print("\nDone!")
