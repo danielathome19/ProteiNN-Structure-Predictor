@@ -340,6 +340,7 @@ def main(mode="train", sequence=""):
             # Evaluate the model's performance on train-eval, downsampled for efficiency
             epoch_training_losses.append(validation(model, dataloader['train-eval']))
             print(f"     Train-eval loss = {epoch_training_losses[-1]:.4f}")
+            torch.save(model.state_dict(), 'model.pt')
         # Evaluate the model on the test set
         epoch_test_losses.append(validation(model, dataloader['test']))
         print(f"Test loss = {epoch_test_losses[-1]:.4f}")
@@ -354,7 +355,6 @@ def main(mode="train", sequence=""):
 
     if mode == "train":
         train(model, 25)
-        torch.save(model.state_dict(), 'model.pt')
 
         # Export the model to ONNX for visualization in Netron
         batch = next(iter(dataloader['train']))
