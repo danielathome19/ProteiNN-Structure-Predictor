@@ -41,7 +41,6 @@ def init_loss_optimizer(model):
     epoch_training_losses = []
     epoch_test_losses = []
     mse_loss = torch.nn.MSELoss()
-
     return optimizer, batch_losses, epoch_training_losses, epoch_test_losses, mse_loss
 
 
@@ -87,10 +86,9 @@ def predict_train(model, dataloader, device):
 
 
 def predict_sequence(model, sequence, device):
-    int_seq = encode_sequence(sequence)
-    int_seq = torch.tensor(int_seq).unsqueeze(0)
-    mask = torch.ones(int_seq.shape)
-    predicted_angles_sincos = model(int_seq.to(device), mask=mask.to(device))
+    int_seq = torch.tensor(encode_sequence(sequence)).unsqueeze(0).to(device)
+    mask = torch.ones(int_seq.shape).to(device)
+    predicted_angles_sincos = model(int_seq, mask=mask)
     predicted_angles = inverse_trig_transform(predicted_angles_sincos)
     sb_pred = scn.BatchedStructureBuilder(int_seq, predicted_angles.cpu())
     sb_pred.to_pdb(0, path='input_pred.pdb')
@@ -162,7 +160,12 @@ class Attention(nn.Module):
                 mask = mask.to(torch.bool)
                 dots = dots.masked_fill(~mask, mask_value)
             except:
-                dots = dots.masked_fill(mask, mask_value)
+                # dots = dots.masked_fill(mask, mask_value)
+                try:  # TODO: remove, this is a hack for now
+                    dots = dots.masked_fill(mask, mask_value)
+                except:
+                    mask = mask[:, :, :dots.shape[-2], :dots.shape[-1]]
+                    dots = dots.masked_fill(mask, mask_value)
 
         # attention
         dots = dots - dots.max(dim=-1, keepdims=True).values
@@ -247,7 +250,7 @@ class ProteinNet(nn.Module):
                                                            enforce_sorted=False)
         output, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(sequence,
                                                                         batch_first=True)
-        # At this point, output has the same dimentionality as the RNN's hidden
+        # At this point, output has the same dimensionality as the RNN's hidden
         # state: i.e. (batch, length, d_hidden).
 
         # We use a linear transformation to transform our output tensor into the
@@ -283,7 +286,6 @@ def main(mode="train", sequence=""):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {device}.")
 
-    # Load the data in the appropriate format for training.
     batch_size = 4
     dataloader = scn.load(
         with_pytorch="dataloaders",
@@ -293,14 +295,14 @@ def main(mode="train", sequence=""):
     # print("Available Dataloaders:", list(dataloader.keys()))
 
     def validation(model, datasplit):
-        """Evaluate a model (sequence->sin/cos represented angles [-1,1]) on MSE."""
+        # Evaluate a model (sequence->sin/cos represented angles [-1,1]) on MSE.
         total = 0.0
         n = 0
         print("Running validation...")
         with torch.no_grad():
             for batch in datasplit:
                 # Prepare variables and create a mask of missing angles (padded with zeros)
-                # The mask is repeated in the last dimension to match the sin/cos represenation.
+                # The mask is repeated in the last dimension to match the sin/cos representation.
                 seqs = batch.int_seqs.to(device).long()
                 mask_ = batch.msks.to(device)
                 true_angles_sincosine = scn.structure.trig_transform(batch.angs).to(device)
@@ -320,14 +322,11 @@ def main(mode="train", sequence=""):
             print(f'Epoch {epoch}')
             progress_bar = tqdm(total=len(dataloader['train']), smoothing=0)
             for batch in dataloader['train']:
-                # Prepare variables and create a mask of missing angles (padded with zeros)
-                # The mask is repeated in the last dimension to match the sin/cos represenation.
                 seqs = batch.int_seqs.to(device).long()
                 mask_ = batch.msks.to(device)
                 true_angles_sincos = scn.structure.trig_transform(batch.angs).to(device)
                 mask = (batch.angs.ne(0)).unsqueeze(-1).repeat(1, 1, 1, 2)
 
-                # Make predictions and optimize
                 predicted_angles = model(seqs, mask=mask_)
                 loss = mse_loss(predicted_angles[mask], true_angles_sincos[mask])
                 loss.backward()
@@ -353,7 +352,6 @@ def main(mode="train", sequence=""):
     model = model.to(device)
     optimizer, batch_losses, epoch_training_losses, epoch_test_losses, mse_loss = init_loss_optimizer(model)
 
-    # TODO: Train the model
     if mode == "train":
         train(model, 25)
         torch.save(model.state_dict(), 'model.pt')
@@ -383,7 +381,6 @@ def main(mode="train", sequence=""):
         predict_train(model, dataloader, device)
 
     if mode == "predict":
-        # Load the model
         model.load_state_dict(torch.load('model.pt'))
         predict_sequence(model, sequence, device)
 
@@ -391,9 +388,7 @@ def main(mode="train", sequence=""):
 
 
 if __name__ == '__main__':
-    print("Hello world!")
-    # mode = input("Choose a mode from one of the following: train, predict: ")
-    modeMain = "predict"
+    modeMain = input("Choose a mode from one of the following: train, predict: ")
     if modeMain not in ["train", "predict"]:
         raise ValueError(f"Invalid mode: {modeMain}")
     else:
@@ -401,9 +396,8 @@ if __name__ == '__main__':
                        "LASHGFVVITIDTNSTLDQPSSRSSQQMAALRQVASLNGTSSSPIYGKVDTARMGVMGWSMGGGGSLISAANNPSLKAAAPQAPWDSS" \
                        "TNFSSVTVPTLIFACENDSIAPVNSSALPIYDSMSRNAKQFLEINGGSHSCANSGNSNQALIGKKGVAWMKRFMDNDTRYSTFACENP" \
                        "NSTRVSDFRTANCSLEDPAANKARKEAELAAATAEQ"
-        if modeMain == "predict:":
-            # s_in = input("Enter a protein sequence, or hit 'Enter' for the default: ")
-            s_in = ""
+        if modeMain == "predict":
+            s_in = input("Enter a protein sequence, or hit 'Enter' for the default: ")
             sequenceMain = s_in if s_in else sequenceMain
         main(modeMain, sequenceMain)
     print("\nDone!")
