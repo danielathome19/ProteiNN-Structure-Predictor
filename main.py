@@ -246,6 +246,7 @@ class ProteinNet(nn.Module):
         # Pass in data into the RNN via PyTorch's pack_padded_sequences
         sequence = torch.nn.utils.rnn.pack_padded_sequence(sequence, lengths, batch_first=True, enforce_sorted=False)
         output, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(sequence, batch_first=True)
+        
         # At this point, output has the same dimensionality as the RNN's hidden state: i.e. (batch, length, d_hidden)
         # Use a linear transformation to transform the output tensor into the correct dimensionality (batch, length, 24)
         output = self.hidden2out(output)
@@ -330,10 +331,12 @@ def main(mode="train", sequence=""):
                 batch_losses.append(float(loss))
                 progress_bar.update(1)
                 progress_bar.set_description(f"\rRMSE Loss = {np.sqrt(float(loss)):.4f}")
+                
             # Evaluate the model's performance on train-eval, downsampled for efficiency
             epoch_training_losses.append(validation(model, dataloader['train-eval']))
             print(f"     Train-eval loss = {epoch_training_losses[-1]:.4f}")
             torch.save(model.state_dict(), 'model.pt')
+            
         # Evaluate the model on the test set
         epoch_test_losses.append(validation(model, dataloader['test']))
         print(f"Test loss = {epoch_test_losses[-1]:.4f}")
