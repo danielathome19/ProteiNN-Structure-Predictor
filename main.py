@@ -50,9 +50,9 @@ def build_visualizable_structures(model, data, device):
         for batch in data:
             model_input = batch.int_seqs.to(device)
             mask_ = batch.msks.to(device)
-            # Make predictions for angles, and construct 3D atomic coordinates
+            # Make predictions for angles and construct 3D atomic coordinates
             predicted_angles_sincos = model(model_input, mask=mask_)
-            # Because the model predicts sin/cos values, we use this function to recover the original angles
+            # Use this function to recover the original angles because the model predicts sin/cos values
             predicted_angles = inverse_trig_transform(predicted_angles_sincos)
             # Use BatchedStructureBuilder to build an entire batch of structures
             sb_pred = scn.BatchedStructureBuilder(batch.int_seqs, predicted_angles.cpu())
@@ -135,7 +135,7 @@ class Attention(nn.Module):
         if exists(tie_dim):
             # as in the paper, for the extra MSAs
             # they average the queries along the rows of the MSAs
-            # they named this particular module MSAColumnGlobalAttention
+            # this particular module is named MSAColumnGlobalAttention
 
             q, k = map(lambda t: rearrange(t, '(b r) ... -> b r ...', r=tie_dim), (q, k))
             q = q.mean(dim=1)
@@ -220,7 +220,7 @@ class ProteinNet(nn.Module):
         # Activation function for the output values (bounds values to [-1, 1])
         self.output_activation = torch.nn.Tanh()
 
-        # We embed our model's input differently depending on the type of input
+        # Embed model's input differently depending on the type of input
         self.integer_sequence = integer_sequence
         if self.integer_sequence:
             self.input_embedding = torch.nn.Embedding(d_in, d_embedding, padding_idx=20)
@@ -237,24 +237,17 @@ class ProteinNet(nn.Module):
 
     def forward(self, sequence, mask=None):
         """Run one forward step of the model."""
-        # First, we compute sequence lengths
+        # Compute sequence lengths
         lengths = self.get_lengths(sequence)
 
-        # Next, we embed our input tensors for input to the RNN
+        # Embed input tensors for input to the RNN
         sequence = self.input_embedding(sequence)
 
-        # Then we pass in our data into the RNN via PyTorch's pack_padded_sequences
-        sequence = torch.nn.utils.rnn.pack_padded_sequence(sequence,
-                                                           lengths,
-                                                           batch_first=True,
-                                                           enforce_sorted=False)
-        output, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(sequence,
-                                                                        batch_first=True)
-        # At this point, output has the same dimensionality as the RNN's hidden
-        # state: i.e. (batch, length, d_hidden).
-
-        # We use a linear transformation to transform our output tensor into the
-        # correct dimensionality (batch, length, 24)
+        # Pass in data into the RNN via PyTorch's pack_padded_sequences
+        sequence = torch.nn.utils.rnn.pack_padded_sequence(sequence, lengths, batch_first=True, enforce_sorted=False)
+        output, output_lengths = torch.nn.utils.rnn.pad_packed_sequence(sequence, batch_first=True)
+        # At this point, output has the same dimensionality as the RNN's hidden state: i.e. (batch, length, d_hidden)
+        # Use a linear transformation to transform the output tensor into the correct dimensionality (batch, length, 24)
         output = self.hidden2out(output)
         output = self.out2attn(output)
         output = self.activation_0(output)
@@ -264,10 +257,10 @@ class ProteinNet(nn.Module):
         output = self.norm_1(output)
         output = self.final(output)
 
-        # Next, we need to bound the output values between [-1, 1]
+        # Bound the output values between [-1, 1]
         output = self.output_activation(output)
 
-        # Finally, reshape the output to be (batch, length, angle, (sin/cos val))
+        # Reshape the output to be (batch, length, angle, (sin/cos val))
         output = output.view(output.shape[0], output.shape[1], 12, 2)
 
         return output
