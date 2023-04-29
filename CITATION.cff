@@ -6,7 +6,7 @@ authors:
   orcid: "https://orcid.org/0000-0002-0350-5771"
 title: "ProteiNN-Structure-Predictor"
 version: 1.0.0
-# doi: TBD
+doi: 10.1101/2023.04.26.538026
 date-released: 2023-04-26
 license: Apache-2.0
 url: "https://github.com/danielathome19/ProteiNN-Structure-Predictor"
