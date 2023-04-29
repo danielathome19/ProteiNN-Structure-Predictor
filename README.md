@@ -1,7 +1,7 @@
 # About
 ProteiNN is a Transformer network trained to predict end-to-end single-sequence protein structure by amino acid sequences. To find out more, check out the provided research paper:
 
-* "Deep Learning for Protein Structure Prediction: Advancements in Structural Bioinformatics" (DOI: TBA)
+* "Deep Learning for Protein Structure Prediction: Advancements in Structural Bioinformatics" (DOI: [10.1101/2023.04.26.538026](https://doi.org/10.1101/2023.04.26.538026))
 * Also contained in the "PaperAndPresentation" folder is the research paper.
 
 # Usage
@@ -23,7 +23,7 @@ If you use this code for your research, please cite this project:
 ```
 @software{Szelogowski_ProteiNN-Structure-Predictor_2023,
  author = {Szelogowski, Daniel},
- doi = {TBD},
+ doi = {10.1101/2023.04.26.538026},
  month = {April},
  title = {{ProteiNN-Structure-Predictor}},
  license = {Apache-2.0},
