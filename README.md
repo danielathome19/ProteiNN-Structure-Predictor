@@ -20,7 +20,7 @@ The code is licensed under Apache License 2.0.
 
 # Citation
 If you use this code for your research, please cite this project:
-```
+```bibtex
 @software{Szelogowski_ProteiNN-Structure-Predictor_2023,
  author = {Szelogowski, Daniel},
  doi = {10.1101/2023.04.26.538026},
