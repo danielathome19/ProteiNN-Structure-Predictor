@@ -1,18 +1,18 @@
 import os
+import torch
+import random
+import py3Dmol
 import warnings
 import numpy as np
-import matplotlib.pyplot as plt
-from einops import rearrange, reduce, repeat
-import sidechainnet as scn
-from sidechainnet.structure.structure import inverse_trig_transform
-from sidechainnet.structure.build_info import NUM_ANGLES
-import py3Dmol
-import torch
-from torch import nn, einsum
-import random
-from inspect import isfunction
-from tqdm import tqdm
 import dill as pickle
+import sidechainnet as scn
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from torch import nn, einsum
+from inspect import isfunction
+from einops import rearrange, reduce, repeat
+from sidechainnet.structure.build_info import NUM_ANGLES
+from sidechainnet.structure.structure import inverse_trig_transform
 
 
 def exists(val):
