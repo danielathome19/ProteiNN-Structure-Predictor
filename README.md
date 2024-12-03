@@ -5,7 +5,9 @@ ProteiNN is a Transformer network trained to predict end-to-end single-sequence 
 * Also contained in the "PaperAndPresentation" folder is the research paper.
 
 # Usage
-Run main.py to choose from either "train" or "predict" modes; train will retrain the model and predict will provide users the option to enter an amino acid sequence to predict the structure of (which will be output as a PDB file).
+Run main.py to choose from either "train", "predict", or "metrics" modes; train will retrain the model and predict will provide users the option to enter an amino acid sequence to predict the structure of (which will be output as a PDB file). Metrics mode will load the trained model and report its classification metrics (e.g., precision, recall, F1 score, etc.) on the test dataset.
+
+**NOTE:** if you have any issues with the code not working as is, it may be due to the version of the `sidechainnet_casp12_30.pkl` file that the sidechainnet library downloads. Please contact me if you would like a copy of the version that I used to train the model.
 
 # Bugs/Features
 Bugs are tracked using the GitHub Issue Tracker.
