@@ -380,12 +380,67 @@ def main(mode="train", sequence=""):
         model.load_state_dict(torch.load('model.pt'))
         predict_sequence(model, sequence, device)
 
+    if mode == "metrics":
+        model.load_state_dict(torch.load('model.pt'))
+        # Compute precision, recall, and F1 score
+        y_true = []
+        y_pred = []
+        with torch.no_grad():
+            for batch in dataloader['test']:
+                seqs = batch.int_seqs.to(device).long()
+                mask_ = batch.msks.to(device)
+                true_angles_sincos = scn.structure.trig_transform(batch.angs).to(device)
+                mask = (batch.angs.ne(0)).unsqueeze(-1).repeat(1, 1, 1, 2)
+
+                predicted_angles = model(seqs, mask=mask_)
+                predicted_angles = predicted_angles[mask].cpu().detach().numpy()
+                true_angles_sincos = true_angles_sincos[mask].cpu().detach().numpy()
+
+                # Append predictions and true values
+                y_pred.extend(predicted_angles)
+                y_true.extend(true_angles_sincos)
+
+        # Flatten and threshold the predictions
+        y_pred = np.asarray(y_pred).flatten()
+        y_true = np.asarray(y_true).flatten()
+        y_pred_binary = (y_pred > 0.3).astype(int)
+        y_true_binary = (y_true > 0).astype(int)
+
+        from sklearn.metrics import precision_score, recall_score, f1_score
+        precision = precision_score(y_true_binary, y_pred_binary)
+        recall = recall_score(y_true_binary, y_pred_binary)
+        f1 = f1_score(y_true_binary, y_pred_binary)
+        print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}")
+
+        from sklearn.metrics import roc_curve, auc, precision_recall_curve
+        fpr, tpr, _ = roc_curve(y_true_binary, y_pred)  # Use continuous predictions
+        roc_auc = auc(fpr, tpr)
+        precision_curve, recall_curve, _ = precision_recall_curve(y_true_binary, y_pred)
+        pr_auc = auc(recall_curve, precision_curve)
+        print(f"ROC AUC: {roc_auc:.4f}")
+        print(f"PR AUC: {pr_auc:.4f}")
+
+        from sklearn.metrics import confusion_matrix
+        import seaborn as sns
+        cm = confusion_matrix(y_true_binary, y_pred_binary)
+        fig = plt.figure(dpi=600)
+        sns.heatmap(cm / np.sum(cm, axis=1, keepdims=True), annot=True, fmt='.2%', cmap='Blues')
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title('Confusion Matrix')
+        plt.savefig('classification_confusion_matrix.png')
+        plt.show()
+
+        from sklearn.metrics import classification_report
+        class_names = ['Helix', 'Sheet']
+        print(classification_report(y_true_binary, y_pred_binary, target_names=class_names))
+
     pass
 
 
 if __name__ == '__main__':
-    modeMain = input("Choose a mode from one of the following: train, predict: ")
-    if modeMain not in ["train", "predict"]:
+    modeMain = input("Choose a mode from one of the following: train, predict, metrics: ")
+    if modeMain not in ["train", "predict", "metrics"]:
         raise ValueError(f"Invalid mode: {modeMain}")
     else:
         sequenceMain = "MGSSHHHHHHSSGLVPRGSHMRGPNPTAASLEASAGPFTVRSFTVSRPSGYGAGTVYYPTNAGGTVGAIAIVPGYTARQSSIKWWGPR" \
